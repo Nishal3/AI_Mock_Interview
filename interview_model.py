@@ -103,11 +103,7 @@ class SelfIntroductionAgent(Agent):
             - Never repeat a question.
             - Ask at most {MAX_INTRO_QUESTIONS} questions.
             - Do not discuss projects or past experience.
-            Once you have learned:
-            + background
-            + skills
-            + education/work history
-            call mark_intro_complete()
+            Once you have completed the goals, call mark_intro_complete()
             """,
             tools=[mark_intro_complete],
         )
