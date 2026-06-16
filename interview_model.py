@@ -3,13 +3,14 @@ from enum import Enum
 from datetime import datetime
 import asyncio
 
-from livekit.agents import Agent
+from livekit.agents import Agent, function_tool, RunContext
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 INTRO_TIMEOUT = 180
+EXP_TIMEOUT = 180
 MAX_INTRO_QUESTIONS = 3
 MAX_EXPERIENCE_QUESTIONS = 4
 
@@ -28,18 +29,57 @@ class InterviewStage(str, Enum):
 @dataclass
 class InterviewState:
     stage: InterviewStage = InterviewStage.SELF_INTRO
-
-    intro_questions_asked: int = 0
-    experience_questions_asked: int = 0
+    supervisor: object | None = None
 
     intro_complete: bool = False
     experience_complete: bool = False
 
-    stage_started_at: datetime = field(default_factory=datetime.now)
+    intro_stage_started_at: datetime = field(default_factory=datetime.now)
+    past_stage_started_at: datetime = field(default_factory=datetime.now)
 
     transition_in_progress: bool = False
 
-    asked_questions: set[str] = field(default_factory=set)
+
+# ============================================================
+# Transition Logic
+# ============================================================
+
+
+@function_tool()
+async def mark_intro_complete(
+    context: RunContext,
+) -> str:
+    """
+    Call when the candidate has provided
+    sufficient background, skills,
+    and education/work history.
+    """
+
+    state = context.session.userdata
+
+    state.intro_complete = True
+
+    await state.supervisor.evaluate_transition()
+
+    return "Introduction marked complete."
+
+
+@function_tool()
+async def mark_past_complete(
+    context: RunContext,
+) -> str:
+    """
+    Call when the candidate has provided
+    sufficient background, skills,
+    and education/work history.
+    """
+    state = context.session.userdata
+
+    state.experience_complete = True
+
+    await state.supervisor.evaluate_finish()
+
+    return "Past experience marked complete."
 
 
 # ============================================================
@@ -49,7 +89,8 @@ class InterviewState:
 
 class SelfIntroductionAgent(Agent):
     def __init__(self):
-        super().__init__(instructions="""
+        super().__init__(
+            instructions=f"""
             You are responsible ONLY for the self-introduction stage.
 
             Goals:
@@ -60,14 +101,22 @@ class SelfIntroductionAgent(Agent):
             Rules:
             - Ask one question at a time.
             - Never repeat a question.
-            - Ask at most 3 questions.
+            - Ask at most {MAX_INTRO_QUESTIONS} questions.
             - Do not discuss projects or past experience.
-            """)
+            Once you have learned:
+            + background
+            + skills
+            + education/work history
+            call mark_intro_complete()
+            """,
+            tools=[mark_intro_complete],
+        )
 
 
 class PastExperienceAgent(Agent):
     def __init__(self):
-        super().__init__(instructions="""
+        super().__init__(
+            instructions=f"""
             You are responsible ONLY for the past-experience stage.
 
             Goals:
@@ -77,9 +126,13 @@ class PastExperienceAgent(Agent):
 
             Rules:
             - Ask one question at a time.
-            - Ask at most 4 questions.
+            - Never repeat a question
+            - Ask at most {MAX_EXPERIENCE_QUESTIONS} questions.
             - Do not restart the introduction stage.
-            """)
+            Once you have accomplished the goals, call mark_past_complete()
+            """,
+            tools=[mark_past_complete],
+        )
 
 
 # ============================================================
@@ -110,6 +163,15 @@ class InterviewSupervisor:
         if state.stage == InterviewStage.SELF_INTRO and state.intro_complete:
             await self.transition_to_experience()
 
+    async def evaluate_finish(self):
+        state = self.state
+
+        if state.transition_in_progress:
+            return
+
+        if state.stage == InterviewStage.PAST_EXPERIENCE and state.experience_complete:
+            await self.transition_to_end()
+
     async def transition_to_experience(self):
         async with self.lock:
 
@@ -119,8 +181,6 @@ class InterviewSupervisor:
                 return
 
             logger.info(f"Transitioning from {state.stage} to PAST_EXPERIENCE")
-
-            state.transition_in_progress = True
 
             try:
 
@@ -135,30 +195,46 @@ class InterviewSupervisor:
                     """)
 
                 state.stage = InterviewStage.PAST_EXPERIENCE
-                state.stage_started_at = datetime.now()
+                state.past_stage_started_at = datetime.now()
 
                 self.session.update_agent(PastExperienceAgent())
 
             finally:
                 state.transition_in_progress = False
 
+    async def transition_to_end(self):
+        async with self.lock:
+            state = self.state
 
-# ============================================================
-# Completion Logic
-# ============================================================
+            state.experience_complete = True
 
+            if state.transition_in_progress:
+                return
 
-def update_intro_completion(state: InterviewState):
+            logger.info(f"Transitioning from {state.stage} to END")
 
-    if state.intro_questions_asked >= MAX_INTRO_QUESTIONS:
-        state.intro_complete = True
+            state.transition_in_progress = True
 
+            try:
 
-def update_experience_completion(state: InterviewState):
+                await self.session.generate_reply(instructions="""
+                    Thank the candidate for talking about their past experience.
 
-    if state.experience_questions_asked >= MAX_EXPERIENCE_QUESTIONS:
-        state.experience_complete = True
-        state.stage = InterviewStage.COMPLETE
+                    Briefly summarize that we now understand
+                    their experiences.
+
+                    Then transition naturally to the end of the conversation.
+                    Be sure to say goodbye to signal the end of the screening.
+                                                  
+                    Mention:
+                    * They will hear back within 10 business days
+                    * Next steps if they are selected
+                    """)
+
+                state.stage = InterviewStage.COMPLETE
+
+            finally:
+                state.transition_in_progress = False
 
 
 # ============================================================
@@ -167,22 +243,34 @@ def update_experience_completion(state: InterviewState):
 
 
 async def force_transition_to_experience(supervisor):
-
     state = supervisor.state
 
     if state.stage != InterviewStage.SELF_INTRO:
         return
 
+    state.intro_complete = True
+
     await supervisor.transition_to_experience()
 
 
-async def timeout_monitor(supervisor):
+async def force_transition_to_end(supervisor):
+    state = supervisor.state
+
+    if state.stage != InterviewStage.PAST_EXPERIENCE:
+        return
+
+    state.experience_complete = True
+
+    await supervisor.transition_to_end()
+
+
+async def intro_timeout_monitor(supervisor):
 
     while True:
 
         state = supervisor.state
 
-        elapsed = (datetime.now() - state.stage_started_at).total_seconds()
+        elapsed = (datetime.now() - state.intro_stage_started_at).total_seconds()
         logger.info(f"Elapsed time: {elapsed}")
 
         if state.stage == InterviewStage.SELF_INTRO and elapsed >= INTRO_TIMEOUT:
@@ -191,29 +279,19 @@ async def timeout_monitor(supervisor):
         await asyncio.sleep(5)
 
 
-# ============================================================
-# Hooks
-# ============================================================
+async def past_timeout_monitor(supervisor):
 
+    while True:
 
-async def on_intro_question_asked(supervisor):
+        state = supervisor.state
 
-    state = supervisor.state
+        elapsed = (datetime.now() - state.past_stage_started_at).total_seconds()
+        logger.info(f"Elapsed_time: {elapsed}")
 
-    state.intro_questions_asked += 1
+        if state.stage == InterviewStage.PAST_EXPERIENCE and elapsed >= EXP_TIMEOUT:
+            await force_transition_to_end(supervisor)
 
-    update_intro_completion(state)
-
-    await supervisor.evaluate_transition()
-
-
-async def on_experience_question_asked(supervisor):
-
-    state = supervisor.state
-
-    state.experience_questions_asked += 1
-
-    update_experience_completion(state)
+        await asyncio.sleep(5)
 
 
 # ============================================================
@@ -227,9 +305,12 @@ async def start_interview(session):
 
     supervisor = InterviewSupervisor(session)
 
+    session.userdata.supervisor = supervisor
+
     session.update_agent(SelfIntroductionAgent())
 
-    asyncio.create_task(timeout_monitor(supervisor))
+    asyncio.create_task(intro_timeout_monitor(supervisor))
+    asyncio.create_task(past_timeout_monitor(supervisor))
 
     await session.generate_reply(instructions="""
         Begin the interview.
@@ -261,78 +342,8 @@ class _MockSessionNoAPI:
         print(f"\n[AGENT SWITCHED]" f" -> {agent.__class__.__name__}")
 
 
-class _MockSessionNoAPI:
-
-    def __init__(self):
-        self.userdata = None
-        self.current_agent = None
-
-    async def generate_reply(self, instructions):
-        print("\n=== AGENT RESPONSE ===")
-        print(instructions)
-
-    def update_agent(self, agent):
-        self.current_agent = agent
-
-        print(f"\n[AGENT SWITCHED]" f" -> {agent.__class__.__name__}")
-
-
 async def _integration_test():
-
-    print("\n==========")
-    print("TEST START")
-    print("==========")
-    session = _MockSessionNoAPI()
-
-    supervisor = await start_interview(session)
-
-    print("\nInitial State:")
-    print(session.userdata)
-
-    assert session.userdata.stage == InterviewStage.SELF_INTRO
-
-    print("\n----------")
-    print("INTRO QUESTIONS")
-    print("----------")
-
-    await on_intro_question_asked(supervisor)
-
-    await on_intro_question_asked(supervisor)
-
-    await on_intro_question_asked(supervisor)
-
-    print("\nState after introduction:")
-    print(session.userdata)
-
-    assert session.userdata.intro_complete
-
-    print(f"Intro Complete: " f"{session.userdata.intro_complete}")
-
-    await supervisor.evaluate_transition()
-
-    assert session.userdata.stage == InterviewStage.PAST_EXPERIENCE
-
-    print(f"Current Stage: " f"{session.userdata.stage}")
-
-    print("\n----------")
-    print("EXPERIENCE QUESTIONS")
-    print("----------")
-
-    await on_experience_question_asked(supervisor)
-    await on_experience_question_asked(supervisor)
-    await on_experience_question_asked(supervisor)
-    await on_experience_question_asked(supervisor)
-
-    print("\nState after past experience:")
-    print(session.userdata)
-
-    assert session.userdata.stage == InterviewStage.COMPLETE
-
-    print(f"Current Stage: " f"{session.userdata.stage}")
-
-    print("\n==========")
-    print("TEST PASSED")
-    print("==========")
+    pass
 
 
 # Keeping this for testing
