@@ -8,12 +8,21 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
+    function_tool,
+    RunContext,
     cli,
     inference,
     room_io,
 )
 from livekit.plugins import ai_coustics, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+from interview_model import (
+    SelfIntroductionAgent,
+    InterviewState,
+    InterviewSupervisor,
+    start_interview,
+)
 
 logger = logging.getLogger("agent")
 
@@ -34,9 +43,11 @@ class Assistant(Agent):
             # 3. Add `from livekit.plugins import openai` to the top of this file
             # 4. Replace the llm argument with:
             #     llm=openai.realtime.RealtimeModel(voice="marin")
-            instructions=textwrap.dedent(
-                """\
-                You are a friendly, reliable voice assistant that answers questions, explains topics, and completes tasks with available tools.
+            instructions=textwrap.dedent("""\
+                REMEMBER THE FOLLOWING INSTRUCTIONS
+                "
+                                         
+                You are a friendly, reliable, and welcoming screening assistant that asks questions, answers questions about the job, and accomplishes tasks.
 
                 # Output rules
 
@@ -51,24 +62,80 @@ class Assistant(Agent):
 
                 # Conversational flow
 
-                - Help the user accomplish their objective efficiently and correctly. Prefer the simplest safe step first. Check understanding and adapt.
+                - Accomplish your objective efficiently and correctly. Prefer the simplest step first. Check understanding and adapt.
                 - Provide guidance in small steps and confirm completion before continuing.
                 - Summarize key results when closing a topic.
 
-                # Tools
+                # Tasks
 
-                - Use available tools as needed, or upon user request.
+                - Use available tools as needed. Do not pause for more than 5 seconds.
                 - Collect required inputs first. Perform actions silently if the runtime expects it.
-                - Speak outcomes clearly. If an action fails, say so once, propose a fallback, or ask how to proceed.
-                - When tools return structured data, summarize it to the user in a way that is easy to understand, and don't directly recite identifiers or other technical details.
+                - When you have structured data, summarize it to the user in a way that is easy to understand, and don't directly recite identifiers or other technical details.
 
                 # Guardrails
 
                 - Stay within safe, lawful, and appropriate use; decline harmful or out-of-scope requests.
                 - For medical, legal, or financial topics, provide general information only and suggest consulting a qualified professional.
                 - Protect privacy and minimize sensitive data.
-                """
-            ),
+                "
+                """),
+        )
+
+    # To add tools, use the @function_tool decorator.
+    # Here's an example that adds a simple weather tool.
+    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
+    # @function_tool
+    # async def lookup_weather(self, context: RunContext, location: str):
+    #     """Use this tool to look up current weather information in the given location.
+    #
+    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
+    #
+    #     Args:
+    #         location: The location to look up weather information for (e.g. city name)
+    #     """
+    #
+    #     logger.info(f"Looking up weather for {location}")
+    #
+    #     return "sunny with a temperature of 70 degrees."
+
+
+@function_tool()
+async def _debug_context(context: RunContext) -> str:
+    state = context.session.userdata
+
+    print("\n========== TOOL CALLED ==========")
+    print(f"userdata type: {type(state)}")
+    print(f"stage: {state.stage}")
+    print("=================================\n")
+
+    return f"Current stage is {state.stage}"
+    # print(type(context))
+    # print(dir(context))
+
+    # if hasattr(context, "session"):
+    #     print("HAS SESSION")
+
+    # return "done"
+
+
+class _testAgent(Agent):
+    def __init__(self) -> None:
+        super().__init__(
+            # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
+            # See all available models at https://docs.livekit.io/agents/models/llm/
+            llm=inference.LLM(model="openai/gpt-5.2-chat-latest"),
+            # To use a realtime model instead of a voice pipeline, replace the LLM
+            # with a RealtimeModel and remove the STT/TTS from the AgentSession
+            # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/)
+            # 1. Install livekit-agents[openai]
+            # 2. Set OPENAI_API_KEY in .env.local
+            # 3. Add `from livekit.plugins import openai` to the top of this file
+            # 4. Replace the llm argument with:
+            #     llm=openai.realtime.RealtimeModel(voice="marin")
+            instructions=textwrap.dedent("""\
+               Run _debug_context() 
+                """),
+            tools=[_debug_context],
         )
 
     # To add tools, use the @function_tool decorator.
@@ -101,6 +168,9 @@ server.setup_fnc = prewarm
 
 @server.rtc_session(agent_name="agent")
 async def my_agent(ctx: JobContext):
+    print(
+        "-----------------------------\nMY_AGENT EXECUTED-----------------------------"
+    )
     # Logging setup
     # Add any other context you want in all log entries here
     ctx.log_context_fields = {
@@ -115,7 +185,7 @@ async def my_agent(ctx: JobContext):
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=inference.TTS(
-            model="cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+            model="cartesia/sonic-3", voice="3e39e9a5-585c-4f5f-bac6-5e4905c51095"
         ),
         # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
         # See more at https://docs.livekit.io/agents/build/turns
@@ -126,6 +196,13 @@ async def my_agent(ctx: JobContext):
         preemptive_generation=True,
     )
 
+    session.userdata = InterviewState()
+
+    supervisor = InterviewSupervisor(session)
+
+    print(dir(session))
+
+    session.userdata.supervisor = supervisor
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
         agent=Assistant(),
@@ -139,8 +216,10 @@ async def my_agent(ctx: JobContext):
         ),
     )
 
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
+    await start_interview(session)
+
+    # Add a virtual avatar to the session, if desired
+    # For other providers, see https://docs.livekit.io/agents/models/avatar/
     # avatar = anam.AvatarSession(
     #     persona_config=anam.PersonaConfig(
     #         name="...",

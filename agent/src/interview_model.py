@@ -3,7 +3,7 @@ from enum import Enum
 from datetime import datetime
 import asyncio
 
-from livekit.agents import Agent, function_tool, RunContext
+from livekit.agents import Agent, function_tool, RunContext, inference
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +37,9 @@ class InterviewState:
     intro_stage_started_at: datetime = field(default_factory=datetime.now)
     past_stage_started_at: datetime = field(default_factory=datetime.now)
 
+    transition_to_past_requested: bool = False
+    transition_to_end_requested: bool = False
+
     transition_in_progress: bool = False
 
 
@@ -55,13 +58,17 @@ async def mark_intro_complete(
     and education/work history.
     """
 
+    logger.info(
+        "\n-------------------------------\nmark_intro_complete CALLED\n-------------------------------"
+    )
+
     state = context.session.userdata
 
     state.intro_complete = True
 
     await state.supervisor.evaluate_transition()
 
-    return "Introduction marked complete."
+    return
 
 
 @function_tool()
@@ -73,13 +80,26 @@ async def mark_past_complete(
     sufficient background, skills,
     and education/work history.
     """
+    logger.info(
+        "\n-------------------------------\nmark_past_complete CALLED\n-------------------------------"
+    )
     state = context.session.userdata
 
     state.experience_complete = True
 
     await state.supervisor.evaluate_finish()
 
-    return "Past experience marked complete."
+    return
+
+
+# @function_tool()
+# async def start_intro_timer(context: RunContext) -> str:
+#     """
+#     Call as soon as the user speaks.
+#     """
+#     state = context.session.userdata
+
+#     state.intro_stage_started_at = datetime.now()
 
 
 # ============================================================
@@ -90,7 +110,10 @@ async def mark_past_complete(
 class SelfIntroductionAgent(Agent):
     def __init__(self):
         super().__init__(
+            llm=inference.LLM(model="openai/gpt-5.2-chat-latest"),
             instructions=f"""
+            GUIDELINES:
+
             You are responsible ONLY for the self-introduction stage.
 
             Goals:
@@ -103,6 +126,8 @@ class SelfIntroductionAgent(Agent):
             - Never repeat a question.
             - Ask at most {MAX_INTRO_QUESTIONS} questions.
             - Do not discuss projects or past experience.
+
+            ON COMPLETION
             Once you have completed the goals, call mark_intro_complete()
             """,
             tools=[mark_intro_complete],
@@ -112,8 +137,13 @@ class SelfIntroductionAgent(Agent):
 class PastExperienceAgent(Agent):
     def __init__(self):
         super().__init__(
+            llm=inference.LLM(model="openai/gpt-5.2-chat-latest"),
             instructions=f"""
-            You are responsible ONLY for the past-experience stage.
+            Transition the conversation smoothly from what has already been discussed. DO NOT REINTRODUCE THIS SECTION.
+            DO NOT DO ANYTHING THAT IS NOT INSTRUCTED.
+            GUIDELINES:
+
+            You are responsible ONLY for the past experience section.
 
             Goals:
             - Learn about previous projects
@@ -125,6 +155,8 @@ class PastExperienceAgent(Agent):
             - Never repeat a question
             - Ask at most {MAX_EXPERIENCE_QUESTIONS} questions.
             - Do not restart the introduction stage.
+
+            ON COMPLETEION
             Once you have accomplished the goals, call mark_past_complete()
             """,
             tools=[mark_past_complete],
@@ -161,6 +193,9 @@ class InterviewSupervisor:
 
     async def evaluate_finish(self):
         state = self.state
+        logger.info(
+            "\n-------------------------------\nevaluate_finish CALLED\n-------------------------------"
+        )
 
         if state.transition_in_progress:
             return
@@ -170,6 +205,9 @@ class InterviewSupervisor:
 
     async def transition_to_experience(self):
         async with self.lock:
+            logger.info(
+                "\n-------------------------------\ntransition_to_experience CALLED\n-------------------------------"
+            )
 
             state = self.state
 
@@ -177,11 +215,22 @@ class InterviewSupervisor:
                 return
 
             logger.info(f"Transitioning from {state.stage} to PAST_EXPERIENCE")
+            state.transition_in_progress = True
 
             try:
 
+                logger.info(
+                    f"---------------------\nGENERATING REPLY; THANKING FOR INTRO\n---------------------"
+                )
+
+                self.session.update_agent(PastExperienceAgent())
+
                 await self.session.generate_reply(instructions="""
-                    Thank the candidate for the introduction.
+                    YOUR TASK NOW IS TO TRANSITION TO THE PAST EXPERIENCE STAGE FROM THE INTRODUCTION STAGE.
+                    
+                    GUIDE:
+                    If the user is still speaking, wait for them to finish!
+                    Be sure to thank the candidate for introducing themselves.
 
                     Briefly summarize that we now understand
                     their background.
@@ -193,13 +242,14 @@ class InterviewSupervisor:
                 state.stage = InterviewStage.PAST_EXPERIENCE
                 state.past_stage_started_at = datetime.now()
 
-                self.session.update_agent(PastExperienceAgent())
-
             finally:
                 state.transition_in_progress = False
 
     async def transition_to_end(self):
         async with self.lock:
+            logger.info(
+                "\n-------------------------------\ntransition_to_end CALLED\n-------------------------------"
+            )
             state = self.state
 
             state.experience_complete = True
@@ -212,9 +262,20 @@ class InterviewSupervisor:
             state.transition_in_progress = True
 
             try:
+                logger.info(
+                    f"---------------------\nGENERATING REPLY; THANKING FOR PAST\n---------------------"
+                )
 
                 await self.session.generate_reply(instructions="""
-                    Thank the candidate for talking about their past experience.
+                    YOU ARE NOW FINISHED WITH THE PAST EXPERIENCE STAGE. YOU SHOULD NOW TRANSITION SMOOTHLY TO THE END OF THE SCREENING PROCESS.
+                    DO NOT REPEAT YOURSELF
+
+                    Finish the screening process by following the below guidelines.
+                                                  
+                    GUIDELINES:
+                    If the user is still speaking, wait for them to finish!
+
+                    Make sure you thank the candidate for talking about their past experience.
 
                     Briefly summarize that we now understand
                     their experiences.
@@ -225,6 +286,8 @@ class InterviewSupervisor:
                     Mention:
                     * They will hear back within 10 business days
                     * Next steps if they are selected
+
+                    SCREENING IS OVER NOW.
                     """)
 
                 state.stage = InterviewStage.COMPLETE
@@ -239,6 +302,9 @@ class InterviewSupervisor:
 
 
 async def force_transition_to_experience(supervisor):
+    logger.info(
+        f"---------------------\nforce_transition_to_experience CALLED\n---------------------"
+    )
     state = supervisor.state
 
     if state.stage != InterviewStage.SELF_INTRO:
@@ -250,6 +316,9 @@ async def force_transition_to_experience(supervisor):
 
 
 async def force_transition_to_end(supervisor):
+    logger.info(
+        f"---------------------\nforce_transition_to_end CALLED\n---------------------"
+    )
     state = supervisor.state
 
     if state.stage != InterviewStage.PAST_EXPERIENCE:
@@ -263,11 +332,14 @@ async def force_transition_to_end(supervisor):
 async def intro_timeout_monitor(supervisor):
 
     while True:
-
         state = supervisor.state
 
+        if state.stage == InterviewStage.PAST_EXPERIENCE:
+            return
+
         elapsed = (datetime.now() - state.intro_stage_started_at).total_seconds()
-        logger.info(f"Elapsed time: {elapsed}")
+        logger.info(f"Elapsed time: {elapsed} in intro timeout monitor")
+        logger.info(f"STAGE = {state.stage}; TIMEOUT = {INTRO_TIMEOUT}")
 
         if state.stage == InterviewStage.SELF_INTRO and elapsed >= INTRO_TIMEOUT:
             await force_transition_to_experience(supervisor)
@@ -278,11 +350,14 @@ async def intro_timeout_monitor(supervisor):
 async def past_timeout_monitor(supervisor):
 
     while True:
-
         state = supervisor.state
 
+        if state.stage == InterviewStage.COMPLETE:
+            return
+
         elapsed = (datetime.now() - state.past_stage_started_at).total_seconds()
-        logger.info(f"Elapsed_time: {elapsed}")
+        logger.info(f"Elapsed time: {elapsed} in past timeout monitor")
+        logger.info(f"STAGE = {state.stage}; TIMEOUT = {EXP_TIMEOUT}")
 
         if state.stage == InterviewStage.PAST_EXPERIENCE and elapsed >= EXP_TIMEOUT:
             await force_transition_to_end(supervisor)
@@ -297,22 +372,17 @@ async def past_timeout_monitor(supervisor):
 
 async def start_interview(session):
 
-    session.userdata = InterviewState()
-
-    supervisor = InterviewSupervisor(session)
-
-    session.userdata.supervisor = supervisor
+    supervisor = session.userdata.supervisor
 
     session.update_agent(SelfIntroductionAgent())
 
+    await session.generate_reply(instructions="""
+        Say hello and ask the candidate to introduce themselves.
+        """)
+
+    session.userdata.intro_stage_started_at = datetime.now()
     asyncio.create_task(intro_timeout_monitor(supervisor))
     asyncio.create_task(past_timeout_monitor(supervisor))
-
-    await session.generate_reply(instructions="""
-        Begin the interview.
-
-        Ask the candidate to introduce themselves.
-        """)
 
     return supervisor
 
