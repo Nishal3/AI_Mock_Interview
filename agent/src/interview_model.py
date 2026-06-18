@@ -92,16 +92,6 @@ async def mark_past_complete(
     return
 
 
-# @function_tool()
-# async def start_intro_timer(context: RunContext) -> str:
-#     """
-#     Call as soon as the user speaks.
-#     """
-#     state = context.session.userdata
-
-#     state.intro_stage_started_at = datetime.now()
-
-
 # ============================================================
 # Stage Agents
 # ============================================================
